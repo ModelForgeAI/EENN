@@ -117,6 +117,7 @@ class data_prep:
 class EENN:
     def __init__(self,params:dict,shape:dict={'size':'auto'}):
         self.params = params
+        self.target = params['target']
         self.shape = self.tree_size(shape)
 
     def tree_size(self,shape:dict) -> dict:
@@ -159,31 +160,6 @@ class EENN:
                 shape_vals[layer] = size_dict[layer][size]
 
         return shape_vals
-    
-    def build_dataset(self,df:pd.DataFrame,outputs:list=None,loss:bool=False) -> tf.data.Dataset:
-        """
-        Converts dataframe to a tensorflow dataset and builds loss function schedule.
-        Args:
-            df: input dataframe
-            outputs: feature models
-            loss: indicator for building loss function schedule
-        Returns:
-            dataset: tensorflow dataset
-        """
-        y_df = df[outputs].copy()
-        y_df.columns = y_df.columns + "_out"
-        y_df['model_target'] = df[self.params['target']]
-        
-        if loss:
-            loss_functions = {}
-            for col in y_df:
-                if ((y_df[col].dtype == int) & (y_df[col].between(0,1,inclusive='both').all())):
-                    loss_functions[col] = 'binary_crossentropy'
-                else:
-                    loss_functions[col] = 'mean_squared_error'
-            self.params['models']['loss_functions'] = loss_functions
-        dataset = tf.data.Dataset.from_tensor_slices((dict(df.drop(self.params['target'],axis=1)),dict(y_df)))
-        return dataset
 
     def weight_initializer(self, shape, dtype=None):
         """
@@ -219,8 +195,107 @@ class EENN:
         new_biases = tf.concat([first_bias, zeros[1:]], axis=0)
         return new_biases
     
-    def batch_scaling(self):
-        print("placeholder")
+    def LSR_dense(self, units, first_node_activation='linear'):
+        """
+        Creates a custom dense layer for the first node.
+        Args:
+            units: number of nodes in the layer
+            first_node_activation: activation function for the first node
+        Returns:
+            CustomDense: custom dense layer
+        """
+        class CustomDense(tf.keras.layers.Layer):
+            def __init__(self, units=32, 
+                         weight_initializer='random_normal', 
+                         bias_initializer='zeros',
+                         first_node_activation='linear', **kwargs):
+                super(CustomDense, self).__init__(**kwargs)
+                self.units = units
+                self.weight_initializer = weight_initializer
+                self.bias_initializer = bias_initializer
+                self.first_node_activation = first_node_activation
+
+            def build(self, input_shape):
+                self.w = self.add_weight(shape=(input_shape[-1], self.units),
+                                         initializer=self.weight_initializer,
+                                         trainable=True)
+                self.b = self.add_weight(shape=(self.units,),
+                                         initializer=self.bias_initializer,
+                                         trainable=True)
+
+            def call(self, inputs):
+                # Apply the appropriate activation function for the first node
+                if self.first_node_activation == 'linear':
+                    y = tf.matmul(inputs, self.w[:, :1]) + self.b[:1]
+                elif self.first_node_activation == 'sigmoid':
+                    y = tf.sigmoid(tf.matmul(inputs, self.w[:, :1]) + self.b[:1])
+                else:
+                    raise ValueError('Invalid activation function')
+
+                # LeakyReLU activation for the other nodes
+                y_rest = tf.nn.leaky_relu(tf.matmul(inputs, self.w[:, 1:]) + self.b[1:])
+                return tf.concat([y, y_rest], axis=-1)
+
+        return CustomDense(units, self.weight_initializer, self.bias_initializer, first_node_activation)
+
+    def dynamic_training(
+            self,model, X_train, y_train, X_val, y_val, 
+            min_batch_size=32, max_batch_size=2048, patience=3):
+        """
+        Trains a model with dynamic batch size and learning rate.
+        Args:
+            model: pre-trained TensorFlow model
+            X_train: input variables to train the model
+            y_train: target variable to train the model
+            X_val: input variables to validate the model
+            y_val: target variable to validate the model
+            min_batch_size: minimum batch size
+            max_batch_size: maximum batch size
+            patience: numper of epochs without improvement before stopping
+        Returns:
+            model: trained model
+        """
+
+        batch_size = min_batch_size
+        best_val_loss = float('inf')
+        best_weights = None
+        cascade = False
+        fails = 0
+
+        while fails < patience:
+            print("current batch size:",batch_size)
+            history = model.fit(X_train, y_train, epochs=1, 
+                                batch_size=batch_size,
+                                validation_data=(X_val,y_val), 
+                                validation_batch_size=max_batch_size,verbose=1)
+            
+            # Get the validation accuracy for this epoch
+            current_val_loss = history.history['val_loss'][-1]
+
+            # Save weights if validation accuracy has improved
+            if current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
+                best_weights = model.get_weights()
+                fails = 0
+                # If cascade is False, double batch size & learning rate
+                if cascade == False and batch_size < max_batch_size:
+                    batch_size *= 2
+                    model.optimizer.lr.assign(model.optimizer.lr * 2)
+            else:
+                # If validation accuracy has not improved, restore best weights and halve learning rate
+                model.set_weights(best_weights)
+                model.optimizer.lr.assign(model.optimizer.lr / 2)
+                fails += 1
+                if fails == 3 and cascade == False:
+                    cascade = True
+                    print("cascade activated")
+                    fails = 0
+                # If cascade is True, halve batch size
+                if cascade and batch_size > min_batch_size:
+                    batch_size = int(batch_size / 2)
+        print("training stopped")
+
+        return model
     
     def feature_model(self,X_train:pd.DataFrame,y_train:pd.DataFrame,
                       X_val:pd.DataFrame,y_val:pd.DataFrame,
@@ -247,19 +322,14 @@ class EENN:
         model.add(tf.keras.layers.Input(shape=(len(X_train.columns),)))
         if prune:
             model.add(tf.keras.layers.Dropout(0.125))
-            model.add(tf.keras.layers.Dense(self.shape['aux'],activation='relu',
-                                            kernel_regularizer=tf.keras.regularizers.l2(0.01),
-                                            kernel_initializer=self.weight_initializer,
-                                            bias_initializer=self.bias_initializer))
+            model.add(self.LSR_dense(self.shape['aux'],first_node_activation=output))
             model.add(tf.keras.layers.Dropout(0.125))
         model.add(tf.keras.layers.Dense(1,activation=output,
                                         kernel_regularizer=tf.keras.regularizers.l2(0.01)))
 
         model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=loss,metrics='accuracy')
-        es = tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=2,restore_best_weights=True)
-        model.fit(X_train,y_train,epochs=10, batch_size=2048,
-                  validation_data=(X_val,y_val),validation_batch_size=2048,callbacks=[es])
-        #model.fit(X_train,y_train,epochs=3, batch_size=2048)
+        model = self.dynamic_training(model, X_train, y_train, X_val, y_val,min_batch_size=128,max_batch_size=4096)
+
         return model
     
     def top_weights(self,model:tf.keras.models.Sequential,cols:list,feature_cnt:int):
@@ -270,9 +340,11 @@ class EENN:
             cols: list of input column names
             feature_cnt: number of top features to extract
         Returns:
-            top_features_idx
+            top_features_nms: list of top feature names
+            top_features_wgt: list of top feature weights
+            biases: bias for the first node
         """
-        weights, biases = model.layers[1].get_weights()
+        weights, biases = model.layers[0].get_weights()
         wgt_features = np.abs(weights[:,0])
         top_features_idx = np.argsort(wgt_features)[-feature_cnt:]
         top_features_nms = [cols[i] for i in top_features_idx]
@@ -287,31 +359,39 @@ class EENN:
         Returns:
             None
         """
-        input_features = [col for col in self.params['data']['train']['X_df'].columns if col not in self.params['emb_layers']]
-        #input_features.remove(self.params['target'])
-        model = self.feature_model(self.params['data']['train']['X_df'][input_features],
-                                   self.params['data']['train']['y_df'],
-                                   self.params['data']['val']['X_df'][input_features],
-                                   self.params['data']['val']['y_df'])
+        input_features = [col for col in self.params['data']['train']['X_df'].columns 
+                          if col not in self.params['emb_layers'].keys() and col != self.target]
         
-        feature_cnt = self.shape['concat'] - ((self.shape['trees']*self.shape['aux'])+self.shape['trees']) ### Add embeddings
+        print('building intial model')
+        model = self.feature_model(self.params['data']['train']['X_df'][input_features],
+                                   self.params['data']['train']['X_df'][self.target],
+                                   self.params['data']['val']['X_df'][input_features],
+                                   self.params['data']['val']['X_df'][self.target])
+        
+        feature_cnt = self.shape['concat']
+        feature_cnt -= (self.shape['trees']*self.shape['aux'])
+        feature_cnt -= self.shape['trees']
+        feature_cnt -= sum(int(len(emb)**0.25) for emb in params['emb_layers'].values())
+
         self.params['passthrough_features'], _, _ = self.top_weights(model,input_features,feature_cnt)
         tree_features, _, _ = self.top_weights(model,input_features,self.shape['trees']-1)
-
-        self.params['models'] = {self.params['target']:{}}
-        self.params['models'][self.params['target']]['features'], self.params['models']['weights'], self.params['models']['biases'] = self.top_weights(
+        
+        self.params['models']['trees'] = {}
+        self.params['models']['trees'][self.target] = {}
+        self.params['models']['trees'][self.target]['features'], self.params['models']['weights'], self.params['models']['biases'] = self.top_weights(
             model,input_features,self.shape['inputs'])
         
-        self.params['models'][self.params['target']]['model'] = self.feature_model(
-            self.params['data']['train']['X_df'][self.params['models'][self.params['target']]['features']],
-            self.params['data']['train']['y_df'],
-            self.params['data']['val']['X_df'][self.params['models'][self.params['target']]['features']],
-            self.params['data']['val']['y_df'],
+        print('Pruning initial model')
+        self.params['models']['trees'][self.target]['model'] = self.feature_model(
+            self.params['data']['train']['X_df'][self.params['models']['trees'][self.target]['features']],
+            self.params['data']['train']['X_df'][self.target],
+            self.params['data']['val']['X_df'][self.params['models']['trees'][self.target]['features']],
+            self.params['data']['val']['X_df'][self.target],
             prune=True)
         
         for tree in tree_features:
             print('Building Tree:',tree)
-            self.params['models'][tree] = {}
+            self.params['models']['trees'][tree] = {}
             input_tree = [feature for feature in input_features if feature != tree]
 
             model = self.feature_model(
@@ -320,13 +400,70 @@ class EENN:
                 self.params['data']['val']['X_df'][input_tree],
                 self.params['data']['val']['X_df'][tree])
             
-            self.params['models'][tree]['features'], self.params['models']['weights'], self.params['models']['biases'] = self.top_weights(
+            self.params['models']['trees'][tree]['features'], self.params['models']['weights'], self.params['models']['biases'] = self.top_weights(
                 model,input_tree,self.shape['inputs'])
             
-            self.params['models'][tree]['model'] = self.feature_model(
-                self.params['data']['train']['X_df'][self.params['models'][tree]['features']],
+            self.params['models']['trees'][tree]['model'] = self.feature_model(
+                self.params['data']['train']['X_df'][self.params['models']['trees'][tree]['features']],
                 self.params['data']['train']['X_df'][tree],
-                self.params['data']['val']['X_df'][self.params['models'][tree]['features']],
+                self.params['data']['val']['X_df'][self.params['models']['trees'][tree]['features']],
                 self.params['data']['val']['X_df'][tree],
                 prune=True)
         return self.params
+    
+    def build_dataset(self,X_df:pd.DataFrame,y_df:pd.DataFrame) -> tf.data.Dataset:
+        """
+        Converts dataframes to a tensorflow dataset.
+        Args:
+            X_df: input dataframe
+            y_df: target dataframe
+        Returns:
+            dataset: tensorflow dataset
+        """
+        dataset = tf.data.Dataset.from_tensor_slices((dict(X_df.drop(self.target,axis=1)),dict(y_df)))
+        return dataset
+    
+    def model_inputs(self):
+        """
+        Creates model inputs.
+        Args:
+            None
+        Returns:
+            model_inputs: dictionary of model inputs
+            feature_outputs: output of the feature layer
+        """
+        model_inputs = {}
+
+        if len(self.params['emb_layers']) > 0:
+            emb_features = []
+            for feature, idx in self.params['emb_layers'].items():
+                if self.params['data']['train']['X_df'][feature].dtypes.name == 'category':
+                    model_inputs[feature] = tf.keras.Input(shape=(1,), name=feature,dtype='string')
+                else:
+                    model_inputs[feature] = tf.keras.Input(shape=(1,), name=feature,dtype='int32')
+                
+                catg_col = tf.feature_column.categorical_column_with_vocabulary_list(feature, idx)
+                emb_col = tf.feature_column.embedding_column(
+                    catg_col,dimension=int(len(idx)**0.25))
+                emb_features.append(emb_col)
+            
+            emb_layer = tf.keras.layers.DenseFeatures(emb_features)
+            emb_outputs = emb_layer(model_inputs)
+        else:
+            emb_outputs = None
+
+        all_features = self.params['passthrough_features']
+        for tree in self.params['models']['trees'].values():
+            all_features += tree['features']
+        all_features = list(set(all_features))
+
+        feature_columns = []
+        for feature in all_features:
+            model_inputs[feature] = tf.keras.Input(shape=(1,), name=feature)
+            feature_columns.append(tf.feature_column.numeric_column(feature))
+            
+        feature_layer = tf.keras.layers.DenseFeatures(feature_columns)
+        feature_outputs = feature_layer({k:v for k,v in model_inputs.items() 
+                                         if k not in self.params['emb_layers'].keys()})
+
+        return model_inputs, emb_outputs, feature_outputs
