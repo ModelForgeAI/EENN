@@ -131,11 +131,11 @@ class EENN:
             shape_vals: dictionary with layer sizes used for building the EENN
         """
         size_dict = {
-            'trees':{'sm':8,'md':16,'lg':16,'xl':32},
-            'inputs':{'sm':8,'md':16,'lg':32,'xl':32},
-            'aux':{'sm':4,'md':4,'lg':8,'xl':8},
-            'concat':{'sm':64,'md':128,'lg':256,'xl':512},
-            'layers':{'sm':128,'md':256,'lg':512,'xl':1024}}
+            'trees':{'xs':4,'sm':8,'md':16,'lg':16,'xl':32},
+            'inputs':{'xs':4,'sm':8,'md':16,'lg':32,'xl':32},
+            'aux':{'xs':2,'sm':4,'md':4,'lg':8,'xl':8},
+            'concat':{'xs':32,'sm':64,'md':128,'lg':256,'xl':512},
+            'layers':{'xs':64,'sm':128,'md':256,'lg':512,'xl':1024}}
         
         if shape.get('size', 'auto') == 'auto':
             feature_cnt = len(self.params['data']['train']['X_df'].columns)
@@ -145,8 +145,10 @@ class EENN:
                 auto_size = 'lg'
             elif feature_cnt >= 48:
                 auto_size = 'md'
-            else:
+            elif feature_cnt >= 16:
                 auto_size = 'sm'
+            else:
+                auto_size = 'xs'
         else:
             auto_size = shape['size']
 
@@ -195,7 +197,7 @@ class EENN:
         new_biases = tf.concat([first_bias, zeros[1:]], axis=0)
         return new_biases
     
-    def LSR_dense(self, units, first_node_activation='linear'):
+    def LSR_dense(self, units:int, first_node_activation:str='linear') -> tf.keras.layers.Layer:
         """
         Creates a custom dense layer for the first node.
         Args:
@@ -239,8 +241,10 @@ class EENN:
         return CustomDense(units, self.weight_initializer, self.bias_initializer, first_node_activation)
 
     def dynamic_training(
-            self,model, X_train, y_train, X_val, y_val, 
-            min_batch_size=32, max_batch_size=2048, patience=3):
+            self, model: tf.keras.Model, 
+            train_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
+            validation_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
+            min_batch_size:int=32, max_batch_size:int=2048, patience:int=3) -> tf.keras.Model:
         """
         Trains a model with dynamic batch size and learning rate.
         Args:
@@ -261,13 +265,20 @@ class EENN:
         best_weights = None
         cascade = False
         fails = 0
+        success = 0
 
         while fails < patience:
             print("current batch size:",batch_size)
-            history = model.fit(X_train, y_train, epochs=1, 
-                                batch_size=batch_size,
-                                validation_data=(X_val,y_val), 
-                                validation_batch_size=max_batch_size,verbose=1)
+            if isinstance(train_data, tuple):
+                history = model.fit(x=train_data[0], y=train_data[1],
+                                    epochs=1, batch_size=batch_size,
+                                    validation_data=validation_data, 
+                                    validation_batch_size=max_batch_size,verbose=1)
+            else:
+                history = model.fit(train_data.batch(batch_size).shuffle(
+                    self.params['data']['train']['X_df'].shape[0]).prefetch(tf.data.experimental.AUTOTUNE),
+                    validation_data=validation_data.batch(max_batch_size), 
+                    epochs=1, verbose=1)
             
             # Get the validation accuracy for this epoch
             current_val_loss = history.history['val_loss'][-1]
@@ -278,14 +289,21 @@ class EENN:
                 best_weights = model.get_weights()
                 fails = 0
                 # If cascade is False, double batch size & learning rate
-                if cascade == False and batch_size < max_batch_size:
-                    batch_size *= 2
-                    model.optimizer.lr.assign(model.optimizer.lr * 2)
+                if cascade == False:
+                    if batch_size < max_batch_size:
+                        batch_size *= 2
+                        model.optimizer.lr.assign(model.optimizer.lr * 2)
+                    elif success == 2:
+                        success = 0
+                        model.optimizer.lr.assign(model.optimizer.lr * 2)
+                    else:
+                        success += 1
             else:
                 # If validation accuracy has not improved, restore best weights and halve learning rate
                 model.set_weights(best_weights)
                 model.optimizer.lr.assign(model.optimizer.lr / 2)
                 fails += 1
+                success = 0
                 if fails == 3 and cascade == False:
                     cascade = True
                     print("cascade activated")
@@ -293,8 +311,6 @@ class EENN:
                 # If cascade is True, halve batch size
                 if cascade and batch_size > min_batch_size:
                     batch_size = int(batch_size / 2)
-        print("training stopped")
-
         return model
     
     def feature_model(self,X_train:pd.DataFrame,y_train:pd.DataFrame,
@@ -328,7 +344,9 @@ class EENN:
                                         kernel_regularizer=tf.keras.regularizers.l2(0.01)))
 
         model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=loss,metrics='accuracy')
-        model = self.dynamic_training(model, X_train, y_train, X_val, y_val,min_batch_size=128,max_batch_size=4096)
+        model = self.dynamic_training(
+            model=model, train_data=(X_train, y_train), validation_data=(X_val, y_val),
+            min_batch_size=128,max_batch_size=4096)
 
         return model
     
@@ -344,7 +362,8 @@ class EENN:
             top_features_wgt: list of top feature weights
             biases: bias for the first node
         """
-        weights, biases = model.layers[0].get_weights()
+        #weights, biases = model.layers[0].get_weights()
+        weights, biases = model.layers[-1].get_weights()
         wgt_features = np.abs(weights[:,0])
         top_features_idx = np.argsort(wgt_features)[-feature_cnt:]
         top_features_nms = [cols[i] for i in top_features_idx]
@@ -467,3 +486,73 @@ class EENN:
                                          if k not in self.params['emb_layers'].keys()})
 
         return model_inputs, emb_outputs, feature_outputs
+    
+    def base_model(self):
+        """
+        Builds the final model.
+        Args:
+            None
+        Returns:
+            model: final model
+        """
+        model_inputs, emb_outputs, feature_outputs = self.model_inputs()
+
+        tree_inputs = []
+        tree_outputs = []
+        for model in self.params['models']['trees'].values():
+            concat = tf.keras.layers.Concatenate()([v for k,v in model_inputs.items() if k in model['features']])
+            tree_inputs.append(model['model'](concat))
+            tree_outputs.append(model['model'].layers[-3](concat))
+
+        combined = tf.keras.layers.Concatenate()(tree_inputs + tree_outputs + [emb_outputs, feature_outputs])
+        #combined = tf.keras.layers.Concatenate()(tree_inputs + [emb_outputs, feature_outputs])
+        layer = tf.keras.layers.Dropout(0.125)(combined)
+        output = tf.keras.layers.Dense(1,name="CatalogPrice")(layer)
+
+        base_model = tf.keras.Model(inputs=model_inputs, outputs=output)
+        base_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss='mean_squared_error',metrics='accuracy')
+
+        self.params['data']['train']['dataset'] = self.build_dataset(
+            self.params['data']['train']['X_df'],self.params['data']['train']['y_df']).cache()
+        self.params['data']['val']['dataset'] = self.build_dataset(
+            self.params['data']['val']['X_df'],self.params['data']['val']['y_df']).cache()
+        base_model = self.dynamic_training(
+            model=base_model, train_data=self.params['data']['train']['dataset'], 
+            validation_data=self.params['data']['val']['dataset'],
+            min_batch_size=128,max_batch_size=4096)
+        #self.params['models']['EENN'] = base_model
+        #return self.params
+        return base_model
+    
+    def grow_model(self,base_model):
+        """
+        Builds a new model with an additional Dense layer, and copies the weights from the base model.
+        Args:
+            base_model: base model
+        Returns:
+            new_model: new model
+        """
+        #base_model = self.params['models']['EENN']
+        self.params['models']['weights'], self.params['models']['biases'] = base_model.layers[-1].get_weights()
+
+        model_inputs = base_model.inputs
+        combined = base_model.layers[-2].output
+        layer = self.LSR_dense(self.shape['layers'],first_node_activation='linear')(combined) ### Combine with other method, activation auto ###
+        layer = tf.keras.layers.Dropout(0.125)(layer)
+        output = tf.keras.layers.Dense(1, name=self.params['target'])(layer)
+        new_model = tf.keras.Model(inputs=model_inputs, outputs=output)
+
+        for new_layer, old_layer in zip(new_model.layers[:-2], base_model.layers[:-1]):
+            new_layer.set_weights(old_layer.get_weights())
+
+        new_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001), loss='mean_squared_error', metrics='accuracy')
+
+        ### Need to save this as variable next run:
+        #trainset = self.build_dataset(self.params['data']['train']['X_df'],self.params['data']['train']['y_df']).cache()
+        #valset = self.build_dataset(self.params['data']['val']['X_df'],self.params['data']['val']['y_df']).cache()
+        new_model = self.dynamic_training(
+            model=new_model, train_data=self.params['data']['train']['dataset'],
+            validation_data=self.params['data']['val']['dataset'],
+            min_batch_size=128,max_batch_size=4096)
+        
+        return new_model
