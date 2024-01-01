@@ -244,7 +244,7 @@ class EENN:
             self, model: tf.keras.Model, 
             train_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
             validation_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
-            min_batch_size:int=32, max_batch_size:int=2048, patience:int=3) -> tf.keras.Model:
+            min_batch_size:int=32, max_batch_size:int=2048, patience:int=3, lock=False) -> tf.keras.Model:
         """
         Trains a model with dynamic batch size and learning rate.
         Args:
@@ -267,6 +267,10 @@ class EENN:
         fails = 0
         success = 0
 
+        if lock:
+            for layer in model.layers[:-3]:
+                layer.trainable = False
+
         while fails < patience:
             print("current batch size:",batch_size)
             if isinstance(train_data, tuple):
@@ -279,6 +283,9 @@ class EENN:
                     self.params['data']['train']['X_df'].shape[0]).prefetch(tf.data.experimental.AUTOTUNE),
                     validation_data=validation_data.batch(max_batch_size), 
                     epochs=1, verbose=1)
+                
+            for layer in model.layers:
+                layer.trainable = True
             
             # Get the validation accuracy for this epoch
             current_val_loss = history.history['val_loss'][-1]
@@ -311,6 +318,7 @@ class EENN:
                 # If cascade is True, halve batch size
                 if cascade and batch_size > min_batch_size:
                     batch_size = int(batch_size / 2)
+                    model.optimizer.lr.assign(model.optimizer.lr / 2)
         return model
     
     def feature_model(self,X_train:pd.DataFrame,y_train:pd.DataFrame,
@@ -333,20 +341,22 @@ class EENN:
         else:
             loss = 'mean_squared_error'
             output = 'linear'
-
+        
+        lock = False
         model = tf.keras.models.Sequential()
         model.add(tf.keras.layers.Input(shape=(len(X_train.columns),)))
         if prune:
             model.add(tf.keras.layers.Dropout(0.125))
             model.add(self.LSR_dense(self.shape['aux'],first_node_activation=output))
             model.add(tf.keras.layers.Dropout(0.125))
+            lock = True
         model.add(tf.keras.layers.Dense(1,activation=output,
                                         kernel_regularizer=tf.keras.regularizers.l2(0.01)))
 
         model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=loss,metrics='accuracy')
         model = self.dynamic_training(
             model=model, train_data=(X_train, y_train), validation_data=(X_val, y_val),
-            min_batch_size=128,max_batch_size=4096)
+            min_batch_size=128,max_batch_size=4096,lock=lock)
 
         return model
     
@@ -422,6 +432,7 @@ class EENN:
             self.params['models']['trees'][tree]['features'], self.params['models']['weights'], self.params['models']['biases'] = self.top_weights(
                 model,input_tree,self.shape['inputs'])
             
+            print('Pruning Tree',tree)
             self.params['models']['trees'][tree]['model'] = self.feature_model(
                 self.params['data']['train']['X_df'][self.params['models']['trees'][tree]['features']],
                 self.params['data']['train']['X_df'][tree],
@@ -553,6 +564,28 @@ class EENN:
         new_model = self.dynamic_training(
             model=new_model, train_data=self.params['data']['train']['dataset'],
             validation_data=self.params['data']['val']['dataset'],
-            min_batch_size=128,max_batch_size=4096)
+            min_batch_size=128,max_batch_size=4096,lock=True)
         
         return new_model
+    
+    def evolve_model(self,base_model):
+
+        #base_model = self.params['models']['EENN']
+        #self.params['models']['weights'], self.params['models']['biases'] = base_model.layers[-1].get_weights()
+
+        best_val_loss = float('inf')
+        grow = True
+        layers = 0
+
+        while grow:
+            layers += 1
+            print("Current Layers:",str(layers))
+            new_model = self.grow_model(base_model)
+            loss, _ = new_model.evaluate(self.params['data']['val']['dataset'].batch(4096))
+            if loss < best_val_loss:
+                best_val_loss = loss
+                base_model = new_model
+            else:
+                grow = False
+
+        return base_model
