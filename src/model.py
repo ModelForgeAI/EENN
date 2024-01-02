@@ -1,118 +1,69 @@
 import tensorflow as tf
 import pandas as pd
 import numpy as np
+from typing import Tuple, Union
 
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import RobustScaler
-from sklearn.preprocessing import MinMaxScaler
+@tf.keras.utils.register_keras_serializable(package='Custom', name='LSR_Dense')
+class LSR_Dense(tf.keras.layers.Layer):
+    def __init__(self, units=32, first_node_activation='linear', pretrained_weights=None, pretrained_biases=None, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.pretrained_weights = pretrained_weights
+        self.pretrained_biases = pretrained_biases
+        self.first_node_activation = first_node_activation
 
-class data_prep:
-    """ class for data preparation """
-    def __init__(self,params:dict):
-        """
-        Initialize data_prep class.
-        Args:
-            params: Dictionary of parameters.
-        """
-        self.params = params
+    def weight_initializer(self, shape, dtype=None):
+        glorot_uniform = tf.keras.initializers.GlorotUniform()
+        if self.pretrained_weights is not None and tf.shape(self.pretrained_weights)[-1] == 1:
+            pretrained_weights = tf.reshape(self.pretrained_weights, (-1,1))
+            random_weights = glorot_uniform((shape[0], shape[1] - 1), dtype=dtype)
+            new_weights = tf.concat([pretrained_weights, random_weights], axis=1)
+        else:
+            new_weights = glorot_uniform(shape, dtype=dtype)
+        return new_weights
 
-    def set_dtypes(self):
-        """
-        Set the data types for the columns in the dataset.
-        Args:
-            None
-        Returns:
-            None
-        """
-        dataset = self.params['data'].copy()
-        dataset.fillna(0,inplace=True)
-        for col in dataset.columns:
-            if col in self.params['emb_layers']:
-                if dataset[col].dtype == object:
-                    dataset.loc[:,col] = dataset[col].astype('category')
-                    dataset.loc[:,col] = dataset.loc[:,col].cat.add_categories('NoVal')
-                else:
-                    dataset.loc[:,col] = dataset[col].astype('int32')
-            else:
-                if dataset[col].dtype == int:
-                    dataset.loc[:,col] = dataset[col].astype('int32')
-                else:
-                    dataset.loc[:,col] = dataset[col].astype('float32')
-        self.params['data'] = dataset
+    def bias_initializer(self, shape, dtype=None):
+        zeros = tf.zeros(shape, dtype=dtype)
+        if self.pretrained_biases is not None and tf.shape(self.pretrained_biases)[-1] == 1:
+            pretrained_biases = tf.reshape(self.pretrained_biases, (-1, 1))
+            zeros = tf.reshape(zeros, (-1, 1))
+            new_biases = tf.concat([pretrained_biases, zeros[1:]], axis=0)
+        else:
+            new_biases = zeros
+        return tf.reshape(new_biases, shape)
 
-    def data_split(self):
-        """
-        Split the dataset into train, validation and test sets.
-        Args:
-            None
-        Returns:
-            None
-        """
-        X_df = self.params['data'].copy()
-        y_df = X_df.pop('CatalogPrice')
-        X_train, X_test, y_train, y_test = train_test_split(X_df, y_df, test_size=0.2,random_state=42)
-        X_val, X_test, y_val, y_test = train_test_split(X_test, y_test, test_size=0.5,random_state=42)
-
-        self.params['data'] = {'train':{'X_df':X_train,'y_df':y_train},
-                               'val':{'X_df':X_val,'y_df':y_val},
-                               'test':{'X_df':X_test,'y_df':y_test}}
+    def build(self, input_shape):
+        self.w = self.add_weight(shape=(input_shape[-1], self.units),
+                                 initializer=self.weight_initializer,
+                                 trainable=True,
+                                 name=self.name + '_w')
+        self.b = self.add_weight(shape=(self.units,),
+                                 initializer=self.bias_initializer,
+                                 trainable=True,
+                                 name=self.name + '_b')
         
-    def train_normalize(self):
-        """ 
-        Train the normalizer on the training set.
-        Args:
-            None
-        Returns:
-            None
-        """
-        norm_cols = []
-        X_df = self.params['data']['train']['X_df'].copy()
-        for col in X_df.columns:
-            if col not in self.params['emb_layers']:
-                if (X_df[col].max() > 10) | (X_df[col].min() < -10):
-                    norm_cols += [col]
+    def call(self, inputs):
+        if self.first_node_activation == 'linear':
+            y = tf.matmul(inputs, self.w[:, :1]) + self.b[:1]
+        elif self.first_node_activation == 'sigmoid':
+            y = tf.sigmoid(tf.matmul(inputs, self.w[:, :1]) + self.b[:1])
+        else:
+            raise ValueError('Invalid activation function')
 
-        if 'models' not in self.params:
-            self.params['models'] = {}
-        
-        self.params['models']['normalize'] = {'robust':RobustScaler().fit(X_df[norm_cols]), 
-                                              'norm_cols':norm_cols}
-        
-        X_df.loc[:,norm_cols] = self.params['models']['normalize']['robust'].transform(X_df[norm_cols])
-        self.params['models']['normalize']['minmax'] = MinMaxScaler(feature_range=(0,1)).fit(X_df[norm_cols])
+        y_rest = tf.nn.leaky_relu(tf.matmul(inputs, self.w[:, 1:]) + self.b[1:])
+        return tf.concat([y, y_rest], axis=-1)
 
-    def normalize(self,split_name:str):
-        """
-        Normalize the data.
-        Args:
-            split_name: Name of the split to normalize.
-        Returns:
-            None
-        """
-        dataset = self.params['data'][split_name]['X_df'].copy()
-        norm_cols = self.params['models']['normalize']['norm_cols']
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'units': self.units,
+            'first_node_activation': self.first_node_activation
+        })
+        return config
 
-        dataset.loc[:,norm_cols] = self.params['models']['normalize']['robust'].transform(dataset[norm_cols])
-        dataset.loc[:,norm_cols] = self.params['models']['normalize']['minmax'].transform(dataset[norm_cols])
-
-        self.params['data'][split_name]['X_df'] = dataset
-
-    def training_pipeline(self) -> dict:
-        """
-        Run the data preparation pipeline.
-        Args:
-            params: Dictionary of parameters.
-        Returns:
-            params: Dictionary of parameters with transformed datasets.
-        """
-        self.set_dtypes()
-        self.data_split()
-        self.train_normalize()
-        self.normalize('train')
-        self.normalize('val')
-        self.normalize('test')
-
-        return self.params
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 class EENN:
     def __init__(self,params:dict,shape:dict={'size':'auto'}):
@@ -162,83 +113,6 @@ class EENN:
                 shape_vals[layer] = size_dict[layer][size]
 
         return shape_vals
-
-    def weight_initializer(self, shape, dtype=None):
-        """
-        Assigns pre-trained weights for the first node and randomly initializes the others.
-        Args:
-            shape: shape of the layer
-            dtype: TensorFlow input
-        Returns:
-            new_weights: initialized outputs
-        """
-        glorot_uniform = tf.keras.initializers.GlorotUniform()
-        new_weights = glorot_uniform(shape, dtype=dtype)
-        new_weights = tf.reshape(new_weights[:, 1:], shape=(-1, shape[1] - 1))
-        pretrained_weights = self.params['models']['weights'].flatten()
-        pretrained_weights = tf.reshape(pretrained_weights, (-1, 1))
-        new_weights = tf.concat([pretrained_weights, new_weights], axis=1)
-        return new_weights
-    
-    def bias_initializer(self, shape, dtype=None):
-        """
-        assigns pre-trained bias for the first node and sets the rest to 0.
-        Args:
-            shape: shape of the layer
-            dtype: TensorFlow input
-        Returns:
-            new_biases: initialized outputs
-        """
-        zeros = tf.zeros(shape, dtype=dtype)
-        pretrained_bias = self.params['models']['biases']
-        if tf.is_tensor(pretrained_bias) and len(pretrained_bias.shape) > 0:
-            pretrained_bias = tf.reshape(pretrained_bias, [])
-        first_bias = tf.fill([1], pretrained_bias)
-        new_biases = tf.concat([first_bias, zeros[1:]], axis=0)
-        return new_biases
-    
-    def LSR_dense(self, units:int, first_node_activation:str='linear') -> tf.keras.layers.Layer:
-        """
-        Creates a custom dense layer for the first node.
-        Args:
-            units: number of nodes in the layer
-            first_node_activation: activation function for the first node
-        Returns:
-            CustomDense: custom dense layer
-        """
-        class CustomDense(tf.keras.layers.Layer):
-            def __init__(self, units=32, 
-                         weight_initializer='random_normal', 
-                         bias_initializer='zeros',
-                         first_node_activation='linear', **kwargs):
-                super(CustomDense, self).__init__(**kwargs)
-                self.units = units
-                self.weight_initializer = weight_initializer
-                self.bias_initializer = bias_initializer
-                self.first_node_activation = first_node_activation
-
-            def build(self, input_shape):
-                self.w = self.add_weight(shape=(input_shape[-1], self.units),
-                                         initializer=self.weight_initializer,
-                                         trainable=True)
-                self.b = self.add_weight(shape=(self.units,),
-                                         initializer=self.bias_initializer,
-                                         trainable=True)
-
-            def call(self, inputs):
-                # Apply the appropriate activation function for the first node
-                if self.first_node_activation == 'linear':
-                    y = tf.matmul(inputs, self.w[:, :1]) + self.b[:1]
-                elif self.first_node_activation == 'sigmoid':
-                    y = tf.sigmoid(tf.matmul(inputs, self.w[:, :1]) + self.b[:1])
-                else:
-                    raise ValueError('Invalid activation function')
-
-                # LeakyReLU activation for the other nodes
-                y_rest = tf.nn.leaky_relu(tf.matmul(inputs, self.w[:, 1:]) + self.b[1:])
-                return tf.concat([y, y_rest], axis=-1)
-
-        return CustomDense(units, self.weight_initializer, self.bias_initializer, first_node_activation)
 
     def dynamic_training(
             self, model: tf.keras.Model, 
@@ -347,7 +221,7 @@ class EENN:
         model.add(tf.keras.layers.Input(shape=(len(X_train.columns),)))
         if prune:
             model.add(tf.keras.layers.Dropout(0.125))
-            model.add(self.LSR_dense(self.shape['aux'],first_node_activation=output))
+            model.add(LSR_Dense(self.shape['aux'],first_node_activation=output,pretrained_weights=self.params['models']['weights'],pretrained_biases=self.params['models']['biases']))
             model.add(tf.keras.layers.Dropout(0.125))
             lock = True
         model.add(tf.keras.layers.Dense(1,activation=output,
@@ -400,7 +274,7 @@ class EENN:
         feature_cnt = self.shape['concat']
         feature_cnt -= (self.shape['trees']*self.shape['aux'])
         feature_cnt -= self.shape['trees']
-        feature_cnt -= sum(int(len(emb)**0.25) for emb in params['emb_layers'].values())
+        feature_cnt -= sum(int(len(emb)**0.25) for emb in self.params['emb_layers'].values())
 
         self.params['passthrough_features'], _, _ = self.top_weights(model,input_features,feature_cnt)
         tree_features, _, _ = self.top_weights(model,input_features,self.shape['trees']-1)
@@ -513,7 +387,12 @@ class EENN:
         for model in self.params['models']['trees'].values():
             concat = tf.keras.layers.Concatenate()([v for k,v in model_inputs.items() if k in model['features']])
             tree_inputs.append(model['model'](concat))
-            tree_outputs.append(model['model'].layers[-3](concat))
+            #tree_outputs.append(model['model'].layers[-3](concat))
+
+            cloned_layer = tf.keras.models.clone_model(model['model'].layers[-3])
+            cloned_layer.build(model['model'].layers[-3].input_shape)
+            cloned_layer.set_weights(model['model'].layers[-3].get_weights())
+            tree_outputs.append(cloned_layer(concat))
 
         combined = tf.keras.layers.Concatenate()(tree_inputs + tree_outputs + [emb_outputs, feature_outputs])
         #combined = tf.keras.layers.Concatenate()(tree_inputs + [emb_outputs, feature_outputs])
@@ -535,7 +414,7 @@ class EENN:
         #return self.params
         return base_model
     
-    def grow_model(self,base_model):
+    def grow_model(self,base_model,dropout=0.125):
         """
         Builds a new model with an additional Dense layer, and copies the weights from the base model.
         Args:
@@ -548,8 +427,10 @@ class EENN:
 
         model_inputs = base_model.inputs
         combined = base_model.layers[-2].output
-        layer = self.LSR_dense(self.shape['layers'],first_node_activation='linear')(combined) ### Combine with other method, activation auto ###
-        layer = tf.keras.layers.Dropout(0.125)(layer)
+
+        ################# add auto actiation #################
+        layer = LSR_Dense(self.shape['layers'],first_node_activation='linear',pretrained_weights=self.params['models']['weights'],pretrained_biases=self.params['models']['biases'])(combined)
+        layer = tf.keras.layers.Dropout(dropout)(layer)
         output = tf.keras.layers.Dense(1, name=self.params['target'])(layer)
         new_model = tf.keras.Model(inputs=model_inputs, outputs=output)
 
@@ -568,24 +449,64 @@ class EENN:
         
         return new_model
     
+    def dropout_scheduler(self,base_model):
+        ### Test
+        best_model = tf.keras.models.clone_model(base_model)
+        best_model.set_weights(base_model.get_weights())
+        del(best_model)
+
+        best_dropout = 0.0625
+        print("Testing Dropout:",str(best_dropout))
+        new_model = self.grow_model(base_model,dropout=best_dropout)
+        best_weights = new_model.get_weights()
+        best_val_loss, _ = new_model.evaluate(self.params['data']['val']['dataset'].batch(4096))
+        
+        for dropout_rate in [0.125, 0.1875,0.25,0.375,0.5]:
+            print("Testing Dropout:",str(dropout_rate))
+            for layer in new_model.layers:
+                if isinstance(layer,tf.keras.layers.Dropout):
+                    layer.rate = dropout_rate
+
+            new_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001), loss='mean_squared_error', metrics='accuracy')
+            new_model = self.dynamic_training(
+                model=new_model, train_data=self.params['data']['train']['dataset'],
+                validation_data=self.params['data']['val']['dataset'],
+                min_batch_size=128,max_batch_size=4096,lock=True)
+            
+            loss, _ = new_model.evaluate(self.params['data']['val']['dataset'].batch(4096))
+            if loss < best_val_loss:
+                best_val_loss = loss
+                best_dropout = dropout_rate
+                best_weights = new_model.get_weights()
+            else:
+                break
+
+            new_model.set_weights(best_weights)
+        print("Best Dropout:",str(best_dropout),"Loss:",best_val_loss)
+
+        return new_model, best_val_loss, best_dropout
+    
     def evolve_model(self,base_model):
 
         #base_model = self.params['models']['EENN']
         #self.params['models']['weights'], self.params['models']['biases'] = base_model.layers[-1].get_weights()
 
-        best_val_loss = float('inf')
+        best_model, best_val_loss, best_dropout = self.dropout_scheduler(base_model)
         grow = True
-        layers = 0
+        layers = 1
 
         while grow:
             layers += 1
             print("Current Layers:",str(layers))
-            new_model = self.grow_model(base_model)
+
+            new_model = tf.keras.models.clone_model(best_model)
+            new_model.set_weights(best_model.get_weights())
+            new_model = self.grow_model(new_model, dropout=best_dropout)
             loss, _ = new_model.evaluate(self.params['data']['val']['dataset'].batch(4096))
             if loss < best_val_loss:
                 best_val_loss = loss
-                base_model = new_model
+                best_model = new_model
             else:
                 grow = False
 
-        return base_model
+        return best_model
