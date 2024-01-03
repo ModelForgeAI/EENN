@@ -48,7 +48,7 @@ class data_prep:
             None
         """
         X_df = self.params['data'].copy()
-        y_df = X_df[[self.params['target']]]
+        y_df = X_df[list(self.params['target'].keys())]
         
         X_train, X_test, y_train, y_test = train_test_split(X_df, y_df, test_size=0.2,random_state=42)
         X_val, X_test, y_val, y_test = train_test_split(X_test, y_test, test_size=0.5,random_state=42)
