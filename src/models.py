@@ -10,8 +10,15 @@ class EENN:
     def __init__(self,params:dict,shape:dict={'size':'auto'}):
         """ Initialize EENN class. """
         self.params = params
-        self.target = list(params['target'].keys())[0]
         self.shape = self.tree_size(shape)
+        self.target = list(params['target'].keys())[0]
+
+        if self.params['target'][self.target] == 'linear':
+            self.activation = 'linear'
+            self.loss = 'mean_squared_error'
+        else:
+            self.activation = 'sigmoid'
+            self.loss = 'binary_crossentropy'
 
     def tree_size(self,shape:dict) -> dict:
         """
@@ -168,7 +175,8 @@ class EENN:
     def tree_model(
             self, X_train: pd.DataFrame, y_train: pd.DataFrame,
             X_val: pd.DataFrame, y_val: pd.DataFrame, grow:bool=False,
-            activation:str='linear') -> tf.keras.models.Sequential:
+            activation:str='linear',
+            loss:str='mean_squared_error') -> tf.keras.models.Sequential:
         """
         Builds a regression model.
         Args:
@@ -176,6 +184,7 @@ class EENN:
             validation_data: input variables to validate the model
             grow: boolean to determine if model should be grown
             activation: activation function for the output layer
+            loss: loss function for compiling the model
         Returns:
             model: trained regression model
         """
@@ -193,11 +202,6 @@ class EENN:
         model.add(tf.keras.layers.Dense(1,activation=activation,
                                         kernel_regularizer=tf.keras.regularizers.l2(0.01)))
 
-        if activation == 'linear':
-            loss = 'mean_squared_error'
-        else:
-            loss = 'binary_crossentropy'
-
         # Compile and train model
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=loss,metrics='accuracy')
@@ -206,48 +210,6 @@ class EENN:
             model=model, train_data=(X_train,y_train), validation_data=(X_val,y_val))
         
         return model
-    
-    def grow_model(
-            self, model:tf.keras.models.Model,
-            train_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
-            validation_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
-            units:int, activation:str='linear') -> tf.keras.models.Model:
-        """
-        Builds a model with an additional output concatinated Dense layer with dropout.
-        Args:
-            model: pre-trained TensorFlow model
-            train_data: input variables to train the model
-            validation_data: input variables to validate the model
-            units: number of nodes in the new layer
-            activation: activation function for the output layer
-        Returns:
-            new_model: new model
-        """
-        # Extract input and output layers from original model
-        input_layer = model.layers[0].input
-        output_layer = model.layers[-1].output
-
-        # Add new layer and dropout on top of original model inputs
-        new_dense = tf.keras.layers.Dense(
-            units,activation=tf.keras.layers.LeakyReLU(alpha=0.01))(input_layer)
-        new_dropout = tf.keras.layers.Dropout(0.125)(new_dense)
-
-        # Combine original model outputs with new layers
-        combined = tf.keras.layers.Concatenate()([output_layer,new_dropout])
-
-        # New model output on top of concatenate layer
-        new_output = tf.keras.layers.Dense(1,activation=activation)(combined)
-        new_model = tf.keras.models.Model(inputs=input_layer, outputs=new_output)
-
-        if activation == 'linear':
-            loss = 'mean_squared_error'
-        else:
-            loss = 'binary_crossentropy'
-
-        # Compile and train model
-        new_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=loss,metrics='accuracy')
-        new_model = self.dynamic_training(model=new_model, train_data=train_data, validation_data=validation_data, lock=True)
-        return new_model
     
     def top_weights(self,model:tf.keras.models.Sequential,cols:list,feature_cnt:int) -> list:
         """
@@ -286,7 +248,7 @@ class EENN:
             y_train = self.params['data']['train']['X_df'][self.target],
             X_val = self.params['data']['val']['X_df'][input_features],
             y_val = self.params['data']['val']['X_df'][self.target],
-            activation=self.params['target'][self.target])
+            activation=self.activation,loss=self.loss)
         
         # Calculate count of additional passthrough features
         feature_cnt = self.shape['concat']
@@ -312,7 +274,7 @@ class EENN:
             y_train=self.params['data']['train']['X_df'][self.target],
             X_val=self.params['data']['val']['X_df'][self.params['models']['trees'][self.target]['features']],
             y_val=self.params['data']['val']['X_df'][self.target],
-            grow=True, activation=self.params['target'][self.target])
+            grow=True, activation=self.activation,loss=self.loss)
         
         # Build and prune feature models for each tree
         for tree in tree_features:
@@ -324,8 +286,10 @@ class EENN:
             if ((self.params['data']['train']['X_df'][tree].dtype == int) &
                 (self.params['data']['train']['X_df'][tree].between(0,1,inclusive='both').all())):
                 activation = 'sigmoid'
+                loss = 'binary_crossentropy'
             else:
                 activation = 'linear'
+                loss = 'mean_squared_error'
 
             print("activation:",activation)
             model = self.tree_model(
@@ -333,7 +297,7 @@ class EENN:
                 y_train=self.params['data']['train']['X_df'][tree],
                 X_val=self.params['data']['val']['X_df'][input_tree],
                 y_val=self.params['data']['val']['X_df'][tree],
-                activation=activation)
+                activation=activation, loss=loss)
             
             # Extract top features from tree model for pruning
             self.params['models']['trees'][tree]['features'] = self.top_weights(
@@ -345,7 +309,7 @@ class EENN:
                 y_train=self.params['data']['train']['X_df'][tree],
                 X_val=self.params['data']['val']['X_df'][self.params['models']['trees'][tree]['features']],
                 y_val=self.params['data']['val']['X_df'][tree],
-                grow=True, activation=activation)
+                grow=True, activation=activation,loss=loss)
         return self.params
     
     def build_dataset(self,X_df:pd.DataFrame,y_df:pd.DataFrame) -> tf.data.Dataset:
@@ -430,30 +394,17 @@ class EENN:
                 layer = l(layer)
             output = model['model'].layers[-1](layer)
 
-            #layer = model['model'].layers[-2](input)
-            #output = model['model'].layers[-1](layer)
-
-            #model_output = model['model'](input)
-            #layer = model_output.layers[-2].output
-            #layer = tf.keras.layers.Dropout(0.125)(layer)
-            #output = model_output.layers[-1].output
-
             tree_inputs.append(input)
             tree_outputs.append(layer)
             tree_outputs.append(output)
         
         # Combine tree models into one base model
         combined = tf.keras.layers.Concatenate()(tree_outputs + [emb_outputs, feature_outputs])
-        output = tf.keras.layers.Dense(1,activation=self.params['target'][self.target],name=self.target)(combined)
-
-        if self.params['target'][self.target] == 'linear':
-            loss = 'mean_squared_error'
-        else:
-            loss = 'binary_crossentropy'
+        output = tf.keras.layers.Dense(1,activation=self.activation,name=self.target)(combined)
 
         # Build and compile model
         base_model = tf.keras.Model(inputs=model_inputs, outputs=output)
-        base_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=loss,metrics='accuracy')
+        base_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=self.loss,metrics='accuracy')
 
         # Convert dataframes to tensorflow datasets
         self.params['data']['train']['dataset'] = self.build_dataset(
@@ -468,3 +419,82 @@ class EENN:
         
         self.params['models']['EENN'] = base_model
         return self.params
+    
+    def grow_model(
+            self, model:tf.keras.models.Model,units:int, 
+            dropout:float=0.125) -> tf.keras.models.Model:
+        """
+        Builds a model with an additional output concatinated Dense layer with dropout.
+        Args:
+            model: pre-trained TensorFlow model
+            units: number of nodes in the new layer
+            dropout: dropout rate for the new layer
+        Returns:
+            new_model: new model
+        """
+        # Extract input and output layers from original model
+        input_layer = model.layers[0].input
+        last_layer = model.layers[-2].output
+
+        # Add new layer and dropout on top of original model inputs
+        new_dense = tf.keras.layers.Dense(
+            units,activation=tf.keras.layers.LeakyReLU(alpha=0.01))(last_layer)
+        new_dropout = tf.keras.layers.Dropout(dropout)(new_dense)
+
+        # Combine original model outputs with new layers
+        combined = tf.keras.layers.Concatenate()([model.layers[-1].output,new_dropout])
+
+        # New model output on top of concatenate layer
+        new_output = tf.keras.layers.Dense(1,activation=self.activation)(combined)
+        new_model = tf.keras.models.Model(inputs=input_layer, outputs=new_output)
+
+        # Compile and train model
+        new_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=self.loss,metrics='accuracy')
+        new_model = self.dynamic_training(
+            model=new_model, 
+            train_data=self.params['data']['train']['dataset'], 
+            validation_data=self.params['data']['val']['dataset'], 
+            lock=True)
+        
+        return new_model
+    
+    def dropout_scheduler(self,model:tf.keras.Model) -> Tuple[tf.keras.Model, float, float]:
+        """
+        Finds the optimal dropout rate for the base model.
+        Args:
+            base_model: base model
+        Returns:
+            best_model: model with the best dropout rate
+            best_val_loss: validation loss of the best model
+            best_dropout: best dropout rate
+        """
+        best_val_loss = float('inf')
+        for dropout_rate in [0.0625, 0.125, 0.1875,0.25,0.375,0.5]:
+            print("Testing Dropout:",str(dropout_rate))
+
+            for layer in model.layers:
+                if isinstance(layer,tf.keras.layers.Dropout):
+                    layer.rate = dropout_rate
+
+            model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001), loss=self.loss, metrics='accuracy')
+
+            if dropout_rate == 0.0625:
+                model = self.grow_model(model,dropout=dropout_rate)
+            else:
+                model = self.dynamic_training(
+                    model=model, train_data=self.params['data']['train']['dataset'],
+                    validation_data=self.params['data']['val']['dataset'], lock=True)
+                
+            loss, _ = model.evaluate(
+                self.params['data']['val']['dataset'].batch(self.params['max_batch_size']))
+            
+            if loss < best_val_loss:
+                best_val_loss = loss
+                best_dropout = dropout_rate
+                best_weights = model.get_weights()
+            else:
+                model.set_weights(best_weights)
+                break
+
+        print("Best Dropout:",str(best_dropout),"Loss:",best_val_loss)
+        return model, best_val_loss, best_dropout
