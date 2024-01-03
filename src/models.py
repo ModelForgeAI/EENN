@@ -328,7 +328,6 @@ class EENN:
                 activation = 'linear'
 
             print("activation:",activation)
-
             model = self.tree_model(
                 X_train=self.params['data']['train']['X_df'][input_tree],
                 y_train=self.params['data']['train']['X_df'][tree],
@@ -347,4 +346,125 @@ class EENN:
                 X_val=self.params['data']['val']['X_df'][self.params['models']['trees'][tree]['features']],
                 y_val=self.params['data']['val']['X_df'][tree],
                 grow=True, activation=activation)
+        return self.params
+    
+    def build_dataset(self,X_df:pd.DataFrame,y_df:pd.DataFrame) -> tf.data.Dataset:
+        """
+        Converts dataframes to a tensorflow dataset.
+        Args:
+            X_df: input dataframe
+            y_df: target dataframe
+        Returns:
+            dataset: tensorflow dataset
+        """
+        dataset = tf.data.Dataset.from_tensor_slices((
+            dict(X_df.drop(self.target,axis=1)),dict(y_df))).cache()
+        return dataset
+    
+    def model_inputs(self) -> Tuple[dict, tf.keras.layers.DenseFeatures, tf.keras.layers.DenseFeatures]:
+        """
+        Creates model inputs.
+        Args:
+            None
+        Returns:
+            model_inputs: dictionary of model inputs
+            emb_outputs: output of the embedding layer
+            feature_outputs: output of the feature layer
+        """
+        model_inputs = {}
+
+        # Create embedding layer
+        if len(self.params['emb_layers']) > 0:
+            emb_features = []
+            for feature, idx in self.params['emb_layers'].items():
+                if self.params['data']['train']['X_df'][feature].dtypes.name == 'category':
+                    model_inputs[feature] = tf.keras.Input(shape=(1,), name=feature,dtype='string')
+                else:
+                    model_inputs[feature] = tf.keras.Input(shape=(1,), name=feature,dtype='int32')
+                
+                catg_col = tf.feature_column.categorical_column_with_vocabulary_list(feature, idx)
+                emb_col = tf.feature_column.embedding_column(
+                    catg_col,dimension=int(len(idx)**0.25))
+                emb_features.append(emb_col)
+            
+            emb_layer = tf.keras.layers.DenseFeatures(emb_features)
+            emb_outputs = emb_layer(model_inputs)
+        else:
+            emb_outputs = None
+
+        # Create feature layer
+        all_features = self.params['passthrough_features']
+        for tree in self.params['models']['trees'].values():
+            all_features += tree['features']
+        all_features = list(set(all_features))
+
+        feature_columns = []
+        for feature in all_features:
+            model_inputs[feature] = tf.keras.Input(shape=(1,), name=feature)
+            feature_columns.append(tf.feature_column.numeric_column(feature))
+            
+        feature_layer = tf.keras.layers.DenseFeatures(feature_columns)
+        feature_outputs = feature_layer({k:v for k,v in model_inputs.items() 
+                                         if k not in self.params['emb_layers'].keys()})
+
+        return model_inputs, emb_outputs, feature_outputs
+    
+    def build_base_model(self):
+        """
+        Builds the base model.
+        Args:
+            None
+        Returns:
+            None
+        """
+        model_inputs, emb_outputs, feature_outputs = self.model_inputs()
+        tree_inputs = []
+        tree_outputs = []
+
+        # Extract tree model outputs
+        for model in self.params['models']['trees'].values():
+            input = tf.keras.layers.Concatenate()([v for k,v in model_inputs.items() if k in model['features']])
+
+            layer = input
+            for l in model['model'].layers[:-1]:
+                layer = l(layer)
+            output = model['model'].layers[-1](layer)
+
+            #layer = model['model'].layers[-2](input)
+            #output = model['model'].layers[-1](layer)
+
+            #model_output = model['model'](input)
+            #layer = model_output.layers[-2].output
+            #layer = tf.keras.layers.Dropout(0.125)(layer)
+            #output = model_output.layers[-1].output
+
+            tree_inputs.append(input)
+            tree_outputs.append(layer)
+            tree_outputs.append(output)
+        
+        # Combine tree models into one base model
+        combined = tf.keras.layers.Concatenate()(tree_outputs + [emb_outputs, feature_outputs])
+        output = tf.keras.layers.Dense(1,activation=self.params['target'][self.target],name=self.target)(combined)
+
+        if self.params['target'][self.target] == 'linear':
+            loss = 'mean_squared_error'
+        else:
+            loss = 'binary_crossentropy'
+
+        # Build and compile model
+        base_model = tf.keras.Model(inputs=model_inputs, outputs=output)
+        base_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=loss,metrics='accuracy')
+
+        # Convert dataframes to tensorflow datasets
+        self.params['data']['train']['dataset'] = self.build_dataset(
+            self.params['data']['train']['X_df'],self.params['data']['train']['y_df'])
+        self.params['data']['val']['dataset'] = self.build_dataset(
+            self.params['data']['val']['X_df'],self.params['data']['val']['y_df'])
+        
+        # Train model
+        base_model = self.dynamic_training(
+            model=base_model, train_data=self.params['data']['train']['dataset'], 
+            validation_data=self.params['data']['val']['dataset'], lock=True)
+        
+        self.params['models']['EENN'] = base_model
         return self.params
