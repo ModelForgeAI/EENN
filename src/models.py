@@ -2,7 +2,7 @@ import tensorflow as tf
 import pandas as pd
 import numpy as np
 
-from sklearn.neighbors import KNeighborsRegressor
+#from sklearn.neighbors import KNeighborsRegressor
 from typing import Tuple, Union
 
 class EENN:
@@ -133,12 +133,12 @@ class EENN:
                         lr_double = True
                         success = 0
                     elif success == 3:
-                        success = 0
                         lr_double = True
+                        success = 0
                 else:
                     if success == 4:
-                        success = 0
                         lr_double = True
+                        success = 0
 
                 if lr_double:
                     lr_double = False
@@ -166,10 +166,9 @@ class EENN:
         return model
     
     def tree_model(
-            self,
-            train_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
-            validation_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
-            grow:bool=False,activation:str='linear') -> tf.keras.models.Sequential:
+            self, X_train: pd.DataFrame, y_train: pd.DataFrame,
+            X_val: pd.DataFrame, y_val: pd.DataFrame, grow:bool=False,
+            activation:str='linear') -> tf.keras.models.Sequential:
         """
         Builds a regression model.
         Args:
@@ -182,7 +181,7 @@ class EENN:
         """
         # Build model
         model = tf.keras.models.Sequential()
-        model.add(tf.keras.layers.Input(shape=(len(train_data[0].columns),)))
+        model.add(tf.keras.layers.Input(shape=(len(X_train.columns),)))
     
         # add dropout and dense layers if second iteration
         if grow:
@@ -191,7 +190,8 @@ class EENN:
                 self.shape['aux'],activation=tf.keras.layers.LeakyReLU(alpha=0.01)))
             model.add(tf.keras.layers.Dropout(0.125))
 
-        model.add(tf.keras.layers.Dense(1,activation=activation))
+        model.add(tf.keras.layers.Dense(1,activation=activation,
+                                        kernel_regularizer=tf.keras.regularizers.l2(0.01)))
 
         if activation == 'linear':
             loss = 'mean_squared_error'
@@ -203,7 +203,7 @@ class EENN:
             optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=loss,metrics='accuracy')
         print(model.summary())
         model = self.dynamic_training(
-            model=model, train_data=train_data, validation_data=validation_data)
+            model=model, train_data=(X_train,y_train), validation_data=(X_val,y_val))
         
         return model
     
@@ -282,12 +282,10 @@ class EENN:
         
         print('Running initial regression')
         model = self.tree_model(
-            train_data=(
-                self.params['data']['train']['X_df'][input_features],
-                self.params['data']['train']['X_df'][self.target]),
-            validation_data=(
-                self.params['data']['val']['X_df'][input_features],
-                self.params['data']['val']['X_df'][self.target]),
+            X_train=self.params['data']['train']['X_df'][input_features],
+            y_train = self.params['data']['train']['X_df'][self.target],
+            X_val = self.params['data']['val']['X_df'][input_features],
+            y_val = self.params['data']['val']['X_df'][self.target],
             activation=self.params['target'][self.target])
         
         # Calculate count of additional passthrough features
@@ -310,14 +308,11 @@ class EENN:
         
         print('Growing initial output tree')
         self.params['models']['trees'][self.target]['model'] = self.tree_model(
-            train_data=(
-                self.params['data']['train']['X_df'][self.params['models']['trees'][self.target]['features']],
-                self.params['data']['train']['X_df'][self.target]),
-            validation_data=(
-                self.params['data']['val']['X_df'][self.params['models']['trees'][self.target]['features']],
-                self.params['data']['val']['X_df'][self.target]),
-            grow=True,
-            activation=self.params['target'][self.target])
+            X_train=self.params['data']['train']['X_df'][self.params['models']['trees'][self.target]['features']],
+            y_train=self.params['data']['train']['X_df'][self.target],
+            X_val=self.params['data']['val']['X_df'][self.params['models']['trees'][self.target]['features']],
+            y_val=self.params['data']['val']['X_df'][self.target],
+            grow=True, activation=self.params['target'][self.target])
         
         # Build and prune feature models for each tree
         for tree in tree_features:
@@ -332,13 +327,13 @@ class EENN:
             else:
                 activation = 'linear'
 
+            print("activation:",activation)
+
             model = self.tree_model(
-                train_data=(
-                    self.params['data']['train']['X_df'][input_tree],
-                    self.params['data']['train']['X_df'][tree]),
-                validation_data=(
-                    self.params['data']['val']['X_df'][input_tree],
-                    self.params['data']['val']['X_df'][tree]),
+                X_train=self.params['data']['train']['X_df'][input_tree],
+                y_train=self.params['data']['train']['X_df'][tree],
+                X_val=self.params['data']['val']['X_df'][input_tree],
+                y_val=self.params['data']['val']['X_df'][tree],
                 activation=activation)
             
             # Extract top features from tree model for pruning
@@ -347,259 +342,9 @@ class EENN:
             
             print('Growing Tree',tree)
             self.params['models']['trees'][tree]['model'] = self.tree_model(
-                train_data=(
-                    self.params['data']['train']['X_df'][self.params['models']['trees'][tree]['features']],
-                    self.params['data']['train']['X_df'][tree]),
-                validation_data=(
-                    self.params['data']['val']['X_df'][self.params['models']['trees'][tree]['features']],
-                    self.params['data']['val']['X_df'][tree]),
-                grow=True,
-                activation=activation)
-        return self.params
-    
-    def build_dataset(self,X_df:pd.DataFrame,y_df:pd.DataFrame) -> tf.data.Dataset:
-        """
-        Converts dataframes to a tensorflow dataset.
-        Args:
-            X_df: input dataframe
-            y_df: target dataframe
-        Returns:
-            dataset: tensorflow dataset
-        """
-        dataset = tf.data.Dataset.from_tensor_slices((dict(X_df.drop(self.target,axis=1)),dict(y_df)))
-        return dataset
-    
-    def model_inputs(self) -> Tuple[dict, tf.keras.layers.DenseFeatures, tf.keras.layers.DenseFeatures]:
-        """
-        Creates model inputs.
-        Args:
-            None
-        Returns:
-            model_inputs: dictionary of model inputs
-            emb_outputs: output of the embedding layer
-            feature_outputs: output of the feature layer
-        """
-        model_inputs = {}
-
-        # Create embedding layer
-        if len(self.params['emb_layers']) > 0:
-            emb_features = []
-            for feature, idx in self.params['emb_layers'].items():
-                if self.params['data']['train']['X_df'][feature].dtypes.name == 'category':
-                    model_inputs[feature] = tf.keras.Input(shape=(1,), name=feature,dtype='string')
-                else:
-                    model_inputs[feature] = tf.keras.Input(shape=(1,), name=feature,dtype='int32')
-                
-                catg_col = tf.feature_column.categorical_column_with_vocabulary_list(feature, idx)
-                emb_col = tf.feature_column.embedding_column(
-                    catg_col,dimension=int(len(idx)**0.25))
-                emb_features.append(emb_col)
-            
-            emb_layer = tf.keras.layers.DenseFeatures(emb_features)
-            emb_outputs = emb_layer(model_inputs)
-        else:
-            emb_outputs = None
-
-        # Create feature layer
-        all_features = self.params['passthrough_features']
-        for tree in self.params['models']['trees'].values():
-            all_features += tree['features']
-        all_features = list(set(all_features))
-
-        feature_columns = []
-        for feature in all_features:
-            model_inputs[feature] = tf.keras.Input(shape=(1,), name=feature)
-            feature_columns.append(tf.feature_column.numeric_column(feature))
-            
-        feature_layer = tf.keras.layers.DenseFeatures(feature_columns)
-        feature_outputs = feature_layer({k:v for k,v in model_inputs.items() 
-                                         if k not in self.params['emb_layers'].keys()})
-
-        return model_inputs, emb_outputs, feature_outputs
-    
-    def base_model(self):
-        """
-        Builds the base model.
-        Args:
-            None
-        Returns:
-            None
-        """
-        model_inputs, emb_outputs, feature_outputs = self.model_inputs()
-        tree_inputs = []
-        tree_outputs = []
-
-        # Extract tree model outputs
-        for model in self.params['models']['trees'].values():
-            concat = tf.keras.layers.Concatenate()([v for k,v in model_inputs.items() if k in model['features']])
-            tree_inputs.append(model['model'](concat))
-
-            cloned_layer = tf.keras.models.clone_model(model['model'].layers[-3])
-            cloned_layer.build(model['model'].layers[-3].input_shape)
-            cloned_layer.set_weights(model['model'].layers[-3].get_weights())
-            tree_outputs.append(cloned_layer(concat))
-
-        # Combine tree models with concatenate layer
-        combined = tf.keras.layers.Concatenate()(tree_inputs + tree_outputs + [emb_outputs, feature_outputs])
-
-        # Build on top of concatenate layer
-        layer = tf.keras.layers.Dropout(0.125)(combined)
-        output = tf.keras.layers.Dense(1,name="CatalogPrice")(layer)
-
-        # Build and compile model
-        base_model = tf.keras.Model(inputs=model_inputs, outputs=output)
-        base_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss='mean_squared_error',metrics='accuracy')
-
-        # Convert dataframes to tensorflow datasets
-        self.params['data']['train']['dataset'] = self.build_dataset(
-            self.params['data']['train']['X_df'],self.params['data']['train']['y_df']).cache()
-        self.params['data']['val']['dataset'] = self.build_dataset(
-            self.params['data']['val']['X_df'],self.params['data']['val']['y_df']).cache()
-        
-        # Train model
-        base_model = self.dynamic_training(
-            model=base_model, train_data=self.params['data']['train']['dataset'], 
-            validation_data=self.params['data']['val']['dataset'],
-            min_batch_size=128,max_batch_size=4096)
-        
-        self.params['models']['EENN'] = base_model
-    
-    def grow_modelX(self,base_model:tf.keras.Model,dropout:float=0.125) -> tf.keras.Model:
-        """
-        Builds a new model with an additional Dense layer, and copies the weights from the base model.
-        Args:
-            base_model: base model
-            dropout: dropout rate
-        Returns:
-            new_model: new model
-        """
-        self.params['models']['weights'], self.params['models']['biases'] = base_model.layers[-1].get_weights()
-
-        # Extract base model inputs and outputs
-        model_inputs = base_model.inputs
-        combined = base_model.layers[-2].output
-
-        ################# add auto actiation #################
-        # Add new layer and dropout on top of base model
-        layer = LSR_Dense(self.shape['layers'],first_node_activation='linear',pretrained_weights=self.params['models']['weights'],pretrained_biases=self.params['models']['biases'])(combined)
-        layer = tf.keras.layers.Dropout(dropout)(layer)
-        output = tf.keras.layers.Dense(1, name=self.params['target'])(layer)
-        new_model = tf.keras.Model(inputs=model_inputs, outputs=output)
-
-        # Copy weights from base model
-        for new_layer, old_layer in zip(new_model.layers[:-2], base_model.layers[:-1]):
-            new_layer.set_weights(old_layer.get_weights())
-
-        # Compile and train model
-        new_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001), loss='mean_squared_error', metrics='accuracy')
-        new_model = self.dynamic_training(
-            model=new_model, train_data=self.params['data']['train']['dataset'],
-            validation_data=self.params['data']['val']['dataset'],
-            min_batch_size=128,max_batch_size=4096,lock=True)
-        
-        return new_model
-    
-    def dropout_scheduler(self,base_model:tf.keras.Model) -> Tuple[tf.keras.Model, float, float]:
-        """
-        Finds the optimal dropout rate for the base model.
-        Args:
-            base_model: base model
-        Returns:
-            best_model: model with the best dropout rate
-            best_val_loss: validation loss of the best model
-            best_dropout: best dropout rate
-        """
-        best_dropout = 0.0625
-        print("Testing Dropout:",str(best_dropout))
-        # Build initial model with minimum dropout rate
-        new_model = self.grow_model(base_model,dropout=best_dropout)
-        best_weights = new_model.get_weights()
-        best_val_loss, _ = new_model.evaluate(self.params['data']['val']['dataset'].batch(4096))
-        
-        # Test increasing dropout rates until validation loss increases
-        for dropout_rate in [0.125, 0.1875,0.25,0.375,0.5]:
-            print("Testing Dropout:",str(dropout_rate))
-            for layer in new_model.layers:
-                if isinstance(layer,tf.keras.layers.Dropout):
-                    layer.rate = dropout_rate
-
-            new_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001), loss='mean_squared_error', metrics='accuracy')
-            new_model = self.dynamic_training(
-                model=new_model, train_data=self.params['data']['train']['dataset'],
-                validation_data=self.params['data']['val']['dataset'],
-                min_batch_size=128,max_batch_size=4096,lock=True)
-            
-            loss, _ = new_model.evaluate(self.params['data']['val']['dataset'].batch(4096))
-            if loss < best_val_loss:
-                best_val_loss = loss
-                best_dropout = dropout_rate
-                best_weights = new_model.get_weights()
-            else:
-                new_model.set_weights(best_weights)
-                break
-
-        print("Best Dropout:",str(best_dropout),"Loss:",best_val_loss)
-        return new_model, best_val_loss, best_dropout
-    
-    def evolve_model(self):
-        """
-        Evolves the EENN model.
-        Args:
-            None
-        Returns:
-            None
-        """
-        # Find optimal dropout rate for base model
-        best_model, best_val_loss, best_dropout = self.dropout_scheduler(self.params['models']['EENN'])
-        grow = True
-        layers = 1
-
-        # Grow model until validation loss increases
-        while grow:
-            layers += 1
-            print("Current Layers:",str(layers))
-
-            new_model = tf.keras.models.clone_model(best_model)
-            new_model.set_weights(best_model.get_weights())
-
-            new_model = self.grow_model(new_model, dropout=best_dropout)
-            loss, _ = new_model.evaluate(self.params['data']['val']['dataset'].batch(4096))
-            if loss < best_val_loss:
-                best_val_loss = loss
-                best_model = new_model
-            else:
-                grow = False
-
-        self.params['models']['EENN'] = best_model
-    
-    def train_ResMem(self):
-        """
-        Trains the ResMem model.
-        Args:
-            None
-        Returns:
-            None
-        """
-        # Calculate residuals using EENN
-        yhat = self.params['models']['EENN'].predict(self.params['data']['train']['dataset'].batch(4096))
-        residule = self.params['data']['train']['y_df'] - yhat
-
-        # Train ResMem model on residules
-        X_df = self.params['data']['train']['X_df'].copy()
-        _ = X_df.pop(self.params['target'])
-        resmem = KNeighborsRegressor(n_neighbors=5).fit(X_df, residule)
-        self.params['models']['ResMem'] = resmem
-
-    def training_pipeline(self) -> dict:
-        """
-        Trains the EENN model with ResMem.
-        Args:
-            None
-        Returns:
-            params: dictionary of model parameters
-        """
-        self.build_feature_models()
-        self.base_model()
-        self.evolve_model()
-        self.train_ResMem()
+                X_train=self.params['data']['train']['X_df'][self.params['models']['trees'][tree]['features']],
+                y_train=self.params['data']['train']['X_df'][tree],
+                X_val=self.params['data']['val']['X_df'][self.params['models']['trees'][tree]['features']],
+                y_val=self.params['data']['val']['X_df'][tree],
+                grow=True, activation=activation)
         return self.params
