@@ -2,7 +2,7 @@ import tensorflow as tf
 import pandas as pd
 import numpy as np
 
-#from sklearn.neighbors import KNeighborsRegressor
+from sklearn.neighbors import KNeighborsRegressor
 from typing import Tuple, Union
 
 class EENN:
@@ -66,8 +66,109 @@ class EENN:
                 shape_vals[layer] = size_dict[layer][size]
 
         return shape_vals
-
+    
     def dynamic_training(
+            self, model: tf.keras.Model, 
+            train_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
+            validation_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
+            patience:int=3, lock=False) -> tf.keras.Model:
+        """
+        Trains a model with dynamic batch size and learning rate.
+        Args:
+            model: pre-trained TensorFlow model
+            train_data: input variables to train the model
+            validation_data: input variables to validate the model
+            patience: numper of epochs without improvement before stopping
+            lock: boolean to determine if layers should be locked
+        Returns:
+            model: trained model
+        """
+
+        # Lock layers for first training round if pruning
+        if lock:
+            for layer in model.layers[:-3]:
+                layer.trainable = False
+
+        # Train model until patience is reached
+        fails = 0
+        success = 0
+        cascade = False
+        sprint = False
+        best_val_loss = float('inf')
+        batch_size = self.params['min_batch_size']
+        early_stopping = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=patience,restore_best_weights=True)
+        
+        while fails < patience:
+            if sprint:
+                sprint = False
+                cascade = True
+                epochs = 1000
+            else:
+                epochs = 1
+
+            if isinstance(train_data, tuple):
+                history = model.fit(x=train_data[0], y=train_data[1],
+                                    epochs=epochs, batch_size=batch_size,
+                                    validation_data=validation_data, 
+                                    validation_batch_size=self.params['max_batch_size'],
+                                    verbose=1, callbacks=[early_stopping])
+                
+            # Train model for one epoch (tf.data.Dataset)
+            else:
+                history = model.fit(train_data.batch(batch_size).shuffle(
+                    self.params['data']['train']['X_df'].shape[0]).prefetch(tf.data.experimental.AUTOTUNE),
+                    validation_data=validation_data.batch(self.params['max_batch_size']), 
+                    epochs=epochs, verbose=1, callbacks=[early_stopping])
+                
+            # Unlock layers after first training round
+            if cascade == False and batch_size == self.params['min_batch_size']:
+                for layer in model.layers:
+                    layer.trainable = True
+
+            # Get the validation accuracy for this epoch
+            current_val_loss = history.history['val_loss'][-1]
+
+            # Save weights if validation accuracy has improved
+            if current_val_loss < best_val_loss:
+                fails = 0
+                success += 1
+                best_val_loss = current_val_loss
+                best_weights = model.get_weights()
+                if cascade == False:
+                    lr_adj = 2
+                    batch_size *= 2
+                else:
+                    lr_adj = 1
+
+            else:
+                model.set_weights(best_weights)
+                fails += 1
+                success = 0
+                lr_adj = 0.5
+                if fails == 3 and cascade==False:
+                    fails = 0
+                    cascade = True
+                if cascade:
+                    batch_size = int(batch_size / 2)
+
+            if model.optimizer.lr * lr_adj > 0.25:
+                model.optimizer.lr.assign(0.25)
+            else:
+                model.optimizer.lr.assign(model.optimizer.lr * lr_adj)
+
+            if batch_size > self.params['max_batch_size']:
+                batch_size = self.params['max_batch_size']
+            elif batch_size < self.params['min_batch_size']:
+                batch_size = self.params['min_batch_size']
+            
+            if batch_size == self.params['max_batch_size'] and cascade == False and success == 3:
+                sprint = True
+                success = 0
+
+        return model
+
+    def dt(
             self, model: tf.keras.Model, 
             train_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
             validation_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
@@ -103,7 +204,6 @@ class EENN:
 
         # Train model until patience is reached
         while fails < patience:
-            print("current batch size:",batch_size)
             # Train model for one epoch (pd.DataFrame)
             if isinstance(train_data, tuple):
                 history = model.fit(x=train_data[0], y=train_data[1],
@@ -205,7 +305,6 @@ class EENN:
         # Compile and train model
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=loss,metrics='accuracy')
-        print(model.summary())
         model = self.dynamic_training(
             model=model, train_data=(X_train,y_train), validation_data=(X_val,y_val))
         
@@ -291,7 +390,6 @@ class EENN:
                 activation = 'linear'
                 loss = 'mean_squared_error'
 
-            print("activation:",activation)
             model = self.tree_model(
                 X_train=self.params['data']['train']['X_df'][input_tree],
                 y_train=self.params['data']['train']['X_df'][tree],
@@ -310,17 +408,21 @@ class EENN:
                 X_val=self.params['data']['val']['X_df'][self.params['models']['trees'][tree]['features']],
                 y_val=self.params['data']['val']['X_df'][tree],
                 grow=True, activation=activation,loss=loss)
-        return self.params
+        #return self.params
     
-    def build_dataset(self,X_df:pd.DataFrame,y_df:pd.DataFrame) -> tf.data.Dataset:
+    def build_dataset(self,X_df:pd.DataFrame,y_df:pd.DataFrame,output_name) -> tf.data.Dataset:
         """
         Converts dataframes to a tensorflow dataset.
         Args:
             X_df: input dataframe
             y_df: target dataframe
+            output_name: name of the target column
         Returns:
             dataset: tensorflow dataset
         """
+        # Rename target column to match model output
+        y_df = y_df.rename(columns={self.target:output_name})
+
         dataset = tf.data.Dataset.from_tensor_slices((
             dict(X_df.drop(self.target,axis=1)),dict(y_df))).cache()
         return dataset
@@ -370,7 +472,9 @@ class EENN:
         feature_layer = tf.keras.layers.DenseFeatures(feature_columns)
         feature_outputs = feature_layer({k:v for k,v in model_inputs.items() 
                                          if k not in self.params['emb_layers'].keys()})
-
+        
+        self.params['models']['EENN'] = {}
+        self.params['models']['EENN']['features'] = list(model_inputs.keys())
         return model_inputs, emb_outputs, feature_outputs
     
     def build_base_model(self):
@@ -400,7 +504,8 @@ class EENN:
         
         # Combine tree models into one base model
         combined = tf.keras.layers.Concatenate()(tree_outputs + [emb_outputs, feature_outputs])
-        output = tf.keras.layers.Dense(1,activation=self.activation,name=self.target)(combined)
+        output_name = self.target + '_0'
+        output = tf.keras.layers.Dense(1,activation=self.activation,name=output_name)(combined)
 
         # Build and compile model
         base_model = tf.keras.Model(inputs=model_inputs, outputs=output)
@@ -408,45 +513,49 @@ class EENN:
 
         # Convert dataframes to tensorflow datasets
         self.params['data']['train']['dataset'] = self.build_dataset(
-            self.params['data']['train']['X_df'],self.params['data']['train']['y_df'])
+            self.params['data']['train']['X_df'],self.params['data']['train']['y_df'],output_name)
         self.params['data']['val']['dataset'] = self.build_dataset(
-            self.params['data']['val']['X_df'],self.params['data']['val']['y_df'])
+            self.params['data']['val']['X_df'],self.params['data']['val']['y_df'],output_name)
         
         # Train model
         base_model = self.dynamic_training(
             model=base_model, train_data=self.params['data']['train']['dataset'], 
             validation_data=self.params['data']['val']['dataset'], lock=True)
         
-        self.params['models']['EENN'] = base_model
-        return self.params
+        self.params['models']['EENN']['model'] = base_model
+        #return self.params
     
     def grow_model(
-            self, model:tf.keras.models.Model,units:int, 
-            dropout:float=0.125) -> tf.keras.models.Model:
+            self, model:tf.keras.models.Model,
+            dropout:float=0.125,
+            output_name:str='target') -> tf.keras.models.Model:
         """
         Builds a model with an additional output concatinated Dense layer with dropout.
         Args:
             model: pre-trained TensorFlow model
-            units: number of nodes in the new layer
             dropout: dropout rate for the new layer
+            output_name: name of the output layer
         Returns:
             new_model: new model
         """
-        # Extract input and output layers from original model
-        input_layer = model.layers[0].input
-        last_layer = model.layers[-2].output
+        base_model = tf.keras.models.Model(inputs=model.inputs, outputs=model.layers[-2].output)
 
-        # Add new layer and dropout on top of original model inputs
+        # Add new layer and dropout on top of second last layer output
         new_dense = tf.keras.layers.Dense(
-            units,activation=tf.keras.layers.LeakyReLU(alpha=0.01))(last_layer)
+            units=self.shape['layers'],activation=tf.keras.layers.LeakyReLU(alpha=0.01))(base_model.output)
         new_dropout = tf.keras.layers.Dropout(dropout)(new_dense)
 
-        # Combine original model outputs with new layers
-        combined = tf.keras.layers.Concatenate()([model.layers[-1].output,new_dropout])
+        # Combine original model output with new dense layer
+        combined = tf.keras.layers.Concatenate()([model.layers[-1].output, new_dropout])
 
         # New model output on top of concatenate layer
-        new_output = tf.keras.layers.Dense(1,activation=self.activation)(combined)
-        new_model = tf.keras.models.Model(inputs=input_layer, outputs=new_output)
+        new_output = tf.keras.layers.Dense(1,activation=self.activation,name=output_name)(combined)
+        new_model = tf.keras.models.Model(inputs=model.inputs, outputs=new_output)
+
+        self.params['data']['train']['dataset'] = self.build_dataset(
+            self.params['data']['train']['X_df'],self.params['data']['train']['y_df'],output_name)
+        self.params['data']['val']['dataset'] = self.build_dataset(
+            self.params['data']['val']['X_df'],self.params['data']['val']['y_df'],output_name)
 
         # Compile and train model
         new_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001),loss=self.loss,metrics='accuracy')
@@ -462,7 +571,7 @@ class EENN:
         """
         Finds the optimal dropout rate for the base model.
         Args:
-            base_model: base model
+            model: base model
         Returns:
             best_model: model with the best dropout rate
             best_val_loss: validation loss of the best model
@@ -472,19 +581,22 @@ class EENN:
         for dropout_rate in [0.0625, 0.125, 0.1875,0.25,0.375,0.5]:
             print("Testing Dropout:",str(dropout_rate))
 
+            # Set dropout rate for all dropout layers and compile model
             for layer in model.layers:
                 if isinstance(layer,tf.keras.layers.Dropout):
                     layer.rate = dropout_rate
 
             model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=.001), loss=self.loss, metrics='accuracy')
 
+            # Grow and train for first run, then retrain for additonal runs
             if dropout_rate == 0.0625:
-                model = self.grow_model(model,dropout=dropout_rate)
+                model = self.grow_model(model,dropout=dropout_rate,output_name=self.target+'_1')
             else:
                 model = self.dynamic_training(
                     model=model, train_data=self.params['data']['train']['dataset'],
                     validation_data=self.params['data']['val']['dataset'], lock=True)
                 
+            # Evaluate model and update if necessary
             loss, _ = model.evaluate(
                 self.params['data']['val']['dataset'].batch(self.params['max_batch_size']))
             
@@ -498,3 +610,117 @@ class EENN:
 
         print("Best Dropout:",str(best_dropout),"Loss:",best_val_loss)
         return model, best_val_loss, best_dropout
+    
+    def evolve_model(self):
+        """
+        Evolves the EENN model.
+        Args:
+            None
+        Returns:
+            None
+        """
+        # Find optimal dropout rate for base model
+        #output_name = self.target+'_1'
+        best_model, best_val_loss, best_dropout = self.dropout_scheduler(
+            self.params['models']['EENN']['model'])
+
+        # Grow model until validation loss increases
+        for layers in range(2,10):
+            print("Current Layers:",str(layers))
+
+            # Clone a new model to preserve best model
+            new_model = tf.keras.models.clone_model(best_model)
+            new_model.set_weights(best_model.get_weights())
+
+            # Grow model and evaluate
+            new_model = self.grow_model(new_model, dropout=best_dropout,output_name=self.target+'_'+str(layers))
+            loss, _ = new_model.evaluate(
+                self.params['data']['val']['dataset'].batch(self.params['max_batch_size']))
+            
+            # Update best model if necessary
+            if loss < best_val_loss:
+                best_val_loss = loss
+                best_model = new_model
+            else:
+                break
+
+        self.params['models']['EENN']['model'] = best_model
+        #return self.params
+    
+    def train_ResMem(self):
+        """
+        Trains the ResMem model.
+        Args:
+            None
+        Returns:
+            None
+        """
+        # Calculate residuals using EENN
+        yhat = self.params['models']['EENN']['model'].predict(self.params['data']['train']['dataset'].batch(4096))
+        residule = self.params['data']['train']['y_df'] - yhat
+
+        # Train ResMem model on residules
+        X_df = self.params['data']['train']['X_df'].copy()
+        _ = X_df.pop(self.target)
+        resmem = KNeighborsRegressor(n_neighbors=5).fit(X_df, residule)
+        self.params['models']['ResMem'] = resmem
+
+    def prune_scalers(self):
+        """
+        Prune fitted scalers by removing the scaling parameters corresponding to dropped features.
+        Args:
+            None
+        Returns:
+            None
+        """
+        # Filter out features not used in the model
+        self.params['models']['normalize']['features'] = [
+            feature for feature in self.params['models']['normalize']['features'] 
+            if feature in self.params['models']['EENN']['features']]
+        
+        # Create a mask that selects only the kept features
+        robust_scaler = self.params['models']['normalize']['robust']
+        minmax_scaler = self.params['models']['normalize']['minmax']
+
+        mask = np.zeros(len(robust_scaler.scale_), dtype=bool)
+        mask[self.params['models']['normalize']['features']] = True
+
+        # Prune the RobustScaler
+        robust_scaler.scale_ = robust_scaler.scale_[mask]
+        robust_scaler.center_ = robust_scaler.center_[mask]
+
+        # Prune the MinMaxScaler
+        minmax_scaler.scale_ = minmax_scaler.scale_[mask]
+        minmax_scaler.min_ = minmax_scaler.min_[mask]
+        minmax_scaler.data_range_ = minmax_scaler.data_range_[mask]
+        minmax_scaler.n_samples_seen_ = minmax_scaler.n_samples_seen_[mask] if hasattr(minmax_scaler, 'n_samples_seen_') else None
+
+        self.params['models']['normalize']['robust'] = robust_scaler
+        self.params['models']['normalize']['minmax'] = minmax_scaler
+
+    def training_pipeline(self) -> dict:
+        """
+        Trains the EENN model with ResMem.
+        Args:
+            None
+        Returns:
+            params: dictionary of final trained parameters
+        """
+        self.build_feature_models()
+        self.build_base_model()
+        self.evolve_model()
+        self.train_ResMem()
+        self.prune_scalers()
+
+        models = {
+            'robust':self.params['models']['normalize']['robust'],
+            'minmax':self.params['models']['normalize']['minmax'],
+            'EENN':self.params['models']['EENN']['model'],
+            'ResMem':self.params['models']['ResMem'],
+            'features':{
+                'model_features':self.params['models']['EENN']['features'],
+                'norm_features':self.params['models']['normalize']['features'],
+                'target':self.target
+            },
+        }
+        return models
