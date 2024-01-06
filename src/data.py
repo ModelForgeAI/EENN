@@ -76,7 +76,7 @@ class data_prep:
             self.params['models'] = {}
         
         self.params['models']['normalize'] = {'robust':RobustScaler().fit(X_df[norm_cols]), 
-                                              'norm_cols':norm_cols}
+                                              'features':norm_cols}
         
         X_df.loc[:,norm_cols] = self.params['models']['normalize']['robust'].transform(X_df[norm_cols])
         self.params['models']['normalize']['minmax'] = MinMaxScaler(feature_range=(0,1)).fit(X_df[norm_cols])
@@ -90,7 +90,7 @@ class data_prep:
             None
         """
         dataset = self.params['data'][split_name]['X_df'].copy()
-        norm_cols = self.params['models']['normalize']['norm_cols']
+        norm_cols = self.params['models']['normalize']['features']
 
         dataset.loc[:,norm_cols] = self.params['models']['normalize']['robust'].transform(dataset[norm_cols])
         dataset.loc[:,norm_cols] = self.params['models']['normalize']['minmax'].transform(dataset[norm_cols])

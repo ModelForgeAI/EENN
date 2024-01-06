@@ -123,6 +123,7 @@ class EENN:
                 
             # Unlock layers after first training round
             if cascade == False and batch_size == self.params['min_batch_size']:
+                print("unlocking layers")
                 for layer in model.layers:
                     layer.trainable = True
 
@@ -140,6 +141,7 @@ class EENN:
                     batch_size *= 2
                 else:
                     lr_adj = 1
+                print("success:",success)
 
             else:
                 model.set_weights(best_weights)
@@ -149,6 +151,7 @@ class EENN:
                 if fails == 3 and cascade==False:
                     fails = 0
                     cascade = True
+                    sprint = True
                 if cascade:
                     batch_size = int(batch_size / 2)
 
@@ -162,114 +165,11 @@ class EENN:
             elif batch_size < self.params['min_batch_size']:
                 batch_size = self.params['min_batch_size']
             
-            if batch_size == self.params['max_batch_size'] and cascade == False and success == 3:
+            print("batch size:",batch_size)
+            if batch_size >= self.params['max_batch_size'] and cascade == False and success >= 3:
                 sprint = True
                 success = 0
 
-        return model
-
-    def dt(
-            self, model: tf.keras.Model, 
-            train_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
-            validation_data: Union[Tuple[pd.DataFrame, pd.DataFrame], tf.data.Dataset],
-            patience:int=3, lock=False) -> tf.keras.Model:
-        """
-        Trains a model with dynamic batch size and learning rate.
-        Args:
-            model: pre-trained TensorFlow model
-            X_train: input variables to train the model
-            y_train: target variable to train the model
-            X_val: input variables to validate the model
-            y_val: target variable to validate the model
-            min_batch_size: minimum batch size
-            max_batch_size: maximum batch size
-            patience: numper of epochs without improvement before stopping
-        Returns:
-            model: trained model
-        """
-        # Set initial batch size and learning rate
-        min_batch_size = self.params['min_batch_size']
-        max_batch_size = self.params['max_batch_size']
-        batch_size = min_batch_size
-        best_val_loss = float('inf')
-        best_weights = None
-        cascade = False
-        fails = 0
-        success = 0
-
-        # Lock layers for first training round if pruning
-        if lock:
-            for layer in model.layers[:-3]:
-                layer.trainable = False
-
-        # Train model until patience is reached
-        while fails < patience:
-            # Train model for one epoch (pd.DataFrame)
-            if isinstance(train_data, tuple):
-                history = model.fit(x=train_data[0], y=train_data[1],
-                                    epochs=1, batch_size=batch_size,
-                                    validation_data=validation_data, 
-                                    validation_batch_size=max_batch_size,verbose=1)
-                
-            # Train model for one epoch (tf.data.Dataset)
-            else:
-                history = model.fit(train_data.batch(batch_size).shuffle(
-                    self.params['data']['train']['X_df'].shape[0]).prefetch(tf.data.experimental.AUTOTUNE),
-                    validation_data=validation_data.batch(max_batch_size), 
-                    epochs=1, verbose=1)
-                
-            # Unlock layers after first training round
-            for layer in model.layers:
-                layer.trainable = True
-            
-            # Get the validation accuracy for this epoch
-            current_val_loss = history.history['val_loss'][-1]
-
-            # Save weights if validation accuracy has improved
-            if current_val_loss < best_val_loss:
-                best_val_loss = current_val_loss
-                best_weights = model.get_weights()
-                fails = 0
-                success += 1
-                lr_double = False
-
-                # If cascade is False, double batch size & learning rate
-                if cascade == False:
-                    if batch_size * 2 <= max_batch_size:
-                        batch_size *= 2
-                        lr_double = True
-                        success = 0
-                    elif success == 3:
-                        lr_double = True
-                        success = 0
-                else:
-                    if success == 4:
-                        lr_double = True
-                        success = 0
-
-                if lr_double:
-                    lr_double = False
-                    if model.optimizer.lr * 2 > 0.25:
-                        model.optimizer.lr.assign(0.25)
-                    else:
-                        model.optimizer.lr.assign(model.optimizer.lr * 2)
-            else:
-                # If validation accuracy has not improved, restore best weights and halve learning rate
-                model.set_weights(best_weights)
-                model.optimizer.lr.assign(model.optimizer.lr / 2)
-                fails += 1
-                success = 0
-
-                # If validation accuracy has not improved for 3 epochs, activate cascade
-                if fails == 3 and cascade == False:
-                    cascade = True
-                    print("cascade activated")
-                    fails = 0
-
-                # If cascade is True, halve batch size
-                if cascade and batch_size > min_batch_size:
-                    batch_size = int(batch_size / 2)
-                    model.optimizer.lr.assign(model.optimizer.lr / 2)
         return model
     
     def tree_model(
@@ -673,28 +573,27 @@ class EENN:
         Returns:
             None
         """
-        # Filter out features not used in the model
-        self.params['models']['normalize']['features'] = [
-            feature for feature in self.params['models']['normalize']['features'] 
-            if feature in self.params['models']['EENN']['features']]
-        
+        # Prune features from the normalizer
+        all_features = self.params['models']['normalize']['features']
+        kept_features = [feature for feature in all_features if feature in self.params['models']['EENN']['features']]
+
         # Create a mask that selects only the kept features
+        mask = np.isin(all_features, kept_features)
+
+        # Prune the scalers
         robust_scaler = self.params['models']['normalize']['robust']
-        minmax_scaler = self.params['models']['normalize']['minmax']
-
-        mask = np.zeros(len(robust_scaler.scale_), dtype=bool)
-        mask[self.params['models']['normalize']['features']] = True
-
-        # Prune the RobustScaler
-        robust_scaler.scale_ = robust_scaler.scale_[mask]
         robust_scaler.center_ = robust_scaler.center_[mask]
+        robust_scaler.scale_ = robust_scaler.scale_[mask]
+        robust_scaler.n_features_in_ = len(kept_features)
 
-        # Prune the MinMaxScaler
-        minmax_scaler.scale_ = minmax_scaler.scale_[mask]
+        minmax_scaler = self.params['models']['normalize']['minmax']
         minmax_scaler.min_ = minmax_scaler.min_[mask]
+        minmax_scaler.scale_ = minmax_scaler.scale_[mask]
         minmax_scaler.data_range_ = minmax_scaler.data_range_[mask]
-        minmax_scaler.n_samples_seen_ = minmax_scaler.n_samples_seen_[mask] if hasattr(minmax_scaler, 'n_samples_seen_') else None
+        minmax_scaler.n_features_in_ = len(kept_features)
 
+        # Update the 'features' list
+        self.params['models']['normalize']['features'] = kept_features
         self.params['models']['normalize']['robust'] = robust_scaler
         self.params['models']['normalize']['minmax'] = minmax_scaler
 
