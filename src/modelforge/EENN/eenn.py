@@ -1,17 +1,10 @@
 import pandas as pd
-from _data_preprocessing import _preprocess_data
+from ._data_preprocessing import _preprocess_data
 
 class EENN:
-    """ Initialize the EENN model. """
     def __init__(self, backend='tensorflow'):
-        if backend == 'tensorflow':
-            from .tensorflow._eenn_tf import EENN_tf as BackendClass
-        elif backend == 'pytorch':
-            from .pytorch._eenn_pt import EENN_pt as BackendClass
-        else:
-            raise ValueError("Unsupported backend: choose 'tensorflow' or 'pytorch'")
-
-        self.backend_model = BackendClass()
+        """ Initialize the EENN model. """
+        self.backend = backend
         self.model = None
 
     def fit(self, 
@@ -35,6 +28,14 @@ class EENN:
         Returns:
             self
         """
+        # Depending on the backend, import the appropriate class
+        if self.backend == 'tensorflow':
+            from .tensorflow._eenn_tf import EENN_tf as BackendClass
+        elif self.backend == 'pytorch':
+            from .pytorch._eenn_pt import EENN_pt as BackendClass
+        else:
+            raise ValueError("Unsupported backend: choose 'tensorflow' or 'pytorch'")
+        
         params = {
             'data':(X_df,y_df),
             'target':{y_df.columns[0]:activation},
@@ -43,10 +44,10 @@ class EENN:
             'max_batch_size':max_batch_size,
             'shape':shape
         }
-
+        
         ### ADD ABILITY TO PASS IN CUSTOM SPLITS ###
         params = _preprocess_data(params).data_pipeline()
-        self.model = self.backend_model.fit(params)
+        self.model = BackendClass(params).training_pipeline()
         return self
     
     ### Placeholder for the predict function ###

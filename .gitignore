@@ -1,2 +1,4 @@
 venv/
 prototype/
+**/__pycache__/
+src/modelforge.egg-info/

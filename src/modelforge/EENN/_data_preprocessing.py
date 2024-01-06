@@ -20,7 +20,9 @@ class _preprocess_data:
         Returns:
             None
         """
-        dataset = self.params['data'].copy()
+        dataset = self.params['data'][0].copy()
+        dataset[self.params['data'][1].columns[0]] = self.params['data'][1]
+
         dataset.fillna(0,inplace=True)
         emb_layers = {}
         for col in dataset.columns:
@@ -36,7 +38,7 @@ class _preprocess_data:
                     dataset.loc[:,col] = dataset[col].astype('int32')
                 else:
                     dataset.loc[:,col] = dataset[col].astype('float32')
-        self.params['data'] = dataset
+        self.params['data'] = (dataset,dataset[[self.params['data'][1].columns[0]]])
         self.params['emb_layers'] = emb_layers
 
     def data_split(self):
@@ -49,8 +51,6 @@ class _preprocess_data:
         """
         X_df = self.params['data'][0]
         y_df = self.params['data'][1]
-
-        X_df[y_df.columns[0]] = y_df
         
         X_train, X_test, y_train, y_test = train_test_split(X_df, y_df, test_size=0.2,random_state=42)
         X_val, X_test, y_val, y_test = train_test_split(X_test, y_test, test_size=0.5,random_state=42)
