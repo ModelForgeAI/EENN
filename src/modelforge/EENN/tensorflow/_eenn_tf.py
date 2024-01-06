@@ -5,12 +5,12 @@ import numpy as np
 from sklearn.neighbors import KNeighborsRegressor
 from typing import Tuple, Union
 
-class EENN:
-    """ Class for training an EENN model. """
-    def __init__(self,params:dict,shape:dict={'size':'auto'}):
+class EENN_tf:
+    """ Class for training an EENN model with TensorFlow. """
+    def __init__(self,params:dict):
         """ Initialize EENN class. """
         self.params = params
-        self.shape = self.tree_size(shape)
+        self.shape = self.tree_size(params['shape'])
         self.target = list(params['target'].keys())[0]
 
         if self.params['target'][self.target] == 'linear':

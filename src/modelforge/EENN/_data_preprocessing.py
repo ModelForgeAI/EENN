@@ -2,7 +2,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler
 from sklearn.preprocessing import MinMaxScaler
 
-class data_prep:
+class _preprocess_data:
     """ class for data preparation """
     def __init__(self,params:dict):
         """
@@ -47,8 +47,10 @@ class data_prep:
         Returns:
             None
         """
-        X_df = self.params['data'].copy()
-        y_df = X_df[list(self.params['target'].keys())]
+        X_df = self.params['data'][0]
+        y_df = self.params['data'][1]
+
+        X_df[y_df.columns[0]] = y_df
         
         X_train, X_test, y_train, y_test = train_test_split(X_df, y_df, test_size=0.2,random_state=42)
         X_val, X_test, y_val, y_test = train_test_split(X_test, y_test, test_size=0.5,random_state=42)
@@ -97,7 +99,7 @@ class data_prep:
 
         self.params['data'][split_name]['X_df'] = dataset
 
-    def training_pipeline(self) -> dict:
+    def data_pipeline(self) -> dict:
         """
         Run the data preparation pipeline.
         Args:
